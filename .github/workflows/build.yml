@@ -1,0 +1,116 @@
+name: Build Flutter
+run-name: Build ${{ inputs.tag }} (${{ inputs.build_type }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag yang berisi source ZIP
+        required: true
+      build_type:
+        description: release atau debug
+        default: release
+      rename_from:
+        description: Domain/port lama (opsional)
+        default: ''
+      rename_to:
+        description: Domain/port baru (opsional)
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Bebaskan ruang disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.32.8'
+          channel: stable
+
+      - name: Download & extract source ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p source
+          gh release download "${{ inputs.tag }}" --repo ${{ github.repository }} --pattern "*.zip" --dir source
+          cd source
+          unzip -q -o ./source.zip || unzip -q -o ./*.zip
+          PUB=$(find . -name pubspec.yaml -not -path '*/__MACOSX/*' -not -path '*/.dart_tool/*' -not -path '*/ephemeral/*' -not -path '*/example/*' -not -path '*/.symlinks/*' | awk '{print length, $0}' | sort -n | sed -n '1p' | cut -d' ' -f2- || true)
+          if [ -z "$PUB" ]; then
+            echo "Isi ZIP (3 level teratas):"
+            find . -maxdepth 3 | head -60 || true
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Zip folder project Flutter yang ada pubspec.yaml."
+            exit 1
+          fi
+          ROOT=$(cd "$(dirname "$PUB")" && pwd)
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+
+      - name: Ganti domain & port (opsional)
+        if: ${{ inputs.rename_from != '' }}
+        env:
+          RN_FROM: ${{ inputs.rename_from }}
+          RN_TO: ${{ inputs.rename_to }}
+        run: |
+          cd "$PROJECT_ROOT"
+          python3 - <<'PY'
+          import os, re
+          f = os.environ['RN_FROM'].strip(); t = os.environ['RN_TO'].strip()
+          fh, _, fp = f.partition(':'); th, _, tp = t.partition(':')
+          reps = []
+          if fh and th:
+              if fp and tp:
+                  reps.append((re.compile(re.escape(fh + ':' + fp) + r'(?!\d)'), th + ':' + tp))
+              reps.append((re.compile(r'(?<![\w.-])' + re.escape(fh) + r'(?![\w-])'), th))
+          elif fp and tp:
+              reps.append((re.compile(r'(?<=:)' + re.escape(fp) + r'(?!\d)'), tp))
+          skip = {'.git', 'build', '.dart_tool', 'node_modules', '.gradle', 'Pods', 'ephemeral', '.idea', '__MACOSX'}
+          ext = ('.dart', '.json', '.yaml', '.yml', '.xml', '.gradle', '.kts', '.properties', '.kt', '.java',
+                 '.swift', '.plist', '.html', '.js', '.ts', '.txt', '.md', '.conf', '.toml', '.env', '.ini', '.cfg')
+          changed = 0
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in skip]
+              for n in files:
+                  if not (n.lower().endswith(ext) or n.startswith('.env')):
+                      continue
+                  p = os.path.join(root, n)
+                  try:
+                      if os.path.getsize(p) > 5_000_000: continue
+                      src = open(p, encoding='utf-8').read()
+                  except Exception:
+                      continue
+                  out = src
+                  for rx, to in reps:
+                      out = rx.sub(to, out)
+                  if out != src:
+                      open(p, 'w', encoding='utf-8').write(out)
+                      changed += 1
+                      if changed <= 40: print('diganti:', p)
+          print('RENAME_CHANGED=%d' % changed)
+          if changed == 0:
+              print('::warning::Domain/port lama tidak ditemukan di source, tidak ada yang diganti.')
+          PY
+
+      - name: Flutter build
+        run: |
+          cd "$PROJECT_ROOT"
+          flutter pub get
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.build_type }}
+          path: ${{ env.PROJECT_ROOT }}/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 1
